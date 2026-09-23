@@ -1,0 +1,38 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  annotations:
+    backstage.io/techdocs-ref: dir:.
+    github.com/project-slug: awsugmed/aws-cdk-devops-agent
+    project_properties:
+      codestar_connection_arn: arn:aws:codestar-connections:<REGION>:<PIPELINE_ACCOUNT_ID>:connection/<CONNECTION_ID>
+      deployment_region: us-east-1
+      dev_account_id: '<DEV_ACCOUNT_ID>'
+      environment: dev
+      owner: platform-team
+      pipeline_account: '<PIPELINE_ACCOUNT_ID>'
+      pipeline_mode: cdk-pipelines
+      prd_account_id: '<PRD_ACCOUNT_ID>'
+      project_name: aws-cdk-devops-agent
+      qa_account_id: '<QA_ACCOUNT_ID>'
+      repo_name: <REPO_NAME>
+      repo_owner: <GITHUB_ORG>
+      vcs_provider: github
+  description: IaC project for aws-cdk-devops-agent
+  name: aws-cdk-devops-agent
+  tags:
+  - devops
+  - devsecops
+  - iac
+  - terraform
+  - terragrunt
+  - module
+  - aws
+  - cloud
+  - automation
+  - template
+spec:
+  lifecycle: production
+  owner: IaCPlatform
+  system: IaCPlatform
+  type: template

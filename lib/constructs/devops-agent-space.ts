@@ -1,0 +1,267 @@
+import * as cdk from 'aws-cdk-lib';
+import * as devopsagent from 'aws-cdk-lib/aws-devopsagent';
+import * as kms from 'aws-cdk-lib/aws-kms';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import { Construct } from 'constructs';
+
+export interface DevOpsAgentSpaceProps {
+  /** Name of the Agent Space */
+  spaceName: string;
+  /** Description */
+  description?: string;
+  /** Locale (BCP-47) determining the language of agent responses (e.g. "es", "pt-BR") */
+  locale?: string;
+  /** Environment (dev/qa/prd) */
+  environment: string;
+  /** Project name for tagging */
+  projectName?: string;
+  /** Owner team for tagging */
+  owner?: string;
+  /** Custom tags (overrides defaults if provided) */
+  tags?: Record<string, string>;
+  /** Enable IAM Identity Center authentication for operator web app */
+  useIdentityCenter?: boolean;
+  /** Identity Center instance ARN */
+  identityCenterInstanceArn?: string;
+  /** Operator app IAM role ARN (required for IAM auth) */
+  operatorAppRoleArn?: string;
+  /**
+   * IAM principal ARNs (e.g. Identity Center permission-set roles) that operate
+   * the incidents web app. They are granted use of the Agent Space CMK for the
+   * SYNCHRONOUS operations the web app performs (key validation, decrypt of
+   * space data), scoped by `kms:ViaService: aidevops.<region>.amazonaws.com`.
+   * Without this, the console shows "The customer managed KMS key cannot be
+   * accessed." Supports wildcards (e.g. an SSO reserved-role path pattern).
+   * See: docs.aws.amazon.com/devopsagent/.../encryption-at-rest-for-devops-agent.html
+   */
+  callerPrincipalArns?: string[];
+}
+
+/**
+ * L2-like construct wrapping AWS::DevOpsAgent::AgentSpace.
+ *
+ * Provisions an Agent Space with:
+ * - KMS CMK encryption (cdk-nag compliant)
+ * - Agent Access Role (AIDevOpsAgentAccessPolicy + Resource Explorer SLR)
+ * - Operator App Role (AIDevOpsOperatorAppAccessPolicy)
+ * - Operator web app auth (IAM or Identity Center)
+ * - Mandatory tagging
+ *
+ * Aligns with: https://docs.aws.amazon.com/devopsagent/latest/userguide/
+ * getting-started-with-aws-devops-agent-getting-started-with-aws-devops-agent-using-aws-cdk.html
+ */
+export class DevOpsAgentSpace extends Construct {
+  public readonly agentSpaceId: string;
+  public readonly agentSpaceArn: string;
+  public readonly encryptionKey: kms.IKey;
+  public readonly agentAccessRole: iam.Role;
+  public readonly operatorRole: iam.Role;
+
+  constructor(scope: Construct, id: string, props: DevOpsAgentSpaceProps) {
+    super(scope, id);
+
+    const account = cdk.Stack.of(this).account;
+    const region = cdk.Stack.of(this).region;
+
+    // KMS key for Agent Space encryption at rest
+    this.encryptionKey = new kms.Key(this, 'EncryptionKey', {
+      alias: `devops-agent/${props.spaceName}`,
+      description: `Encryption key for DevOps Agent Space: ${props.spaceName}`,
+      enableKeyRotation: true,
+      removalPolicy: props.environment === 'prd' ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Grant the DevOps Agent service principal access to use the CMK.
+    // Required when passing kmsKeyArn to CfnAgentSpace — otherwise the service
+    // handler returns AccessDenied because it cannot use the customer-managed key.
+    this.encryptionKey.addToResourcePolicy(
+      new iam.PolicyStatement({
+        sid: 'AllowDevOpsAgentServiceUseOfKey',
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('aidevops.amazonaws.com')],
+        actions: [
+          'kms:Encrypt',
+          'kms:Decrypt',
+          'kms:ReEncrypt*',
+          'kms:GenerateDataKey*',
+          'kms:DescribeKey',
+          'kms:CreateGrant',
+        ],
+        resources: ['*'],
+        conditions: {
+          StringEquals: {
+            'aws:SourceAccount': account,
+          },
+        },
+      }),
+    );
+
+    // Grant the WEB APP CALLER principals use of the CMK for SYNCHRONOUS operations.
+    // The DevOps Agent web app validates the key and decrypts Agent Space data using
+    // the *caller's* credentials (your Identity Center permission-set role), not just
+    // the service principal. Scope to DevOps Agent via `kms:ViaService` so the grant
+    // cannot be used for anything else. Without this the console reports:
+    //   "The customer managed KMS key cannot be accessed."
+    if (props.callerPrincipalArns && props.callerPrincipalArns.length > 0) {
+      this.encryptionKey.addToResourcePolicy(
+        new iam.PolicyStatement({
+          sid: 'AllowCallerAccessViaService',
+          effect: iam.Effect.ALLOW,
+          principals: props.callerPrincipalArns.map((arn) => new iam.ArnPrincipal(arn)),
+          actions: [
+            'kms:DescribeKey',
+            'kms:GenerateDataKey*',
+            'kms:Decrypt',
+            'kms:Encrypt',
+            'kms:ReEncrypt*',
+          ],
+          resources: ['*'],
+          conditions: {
+            StringEquals: {
+              'kms:ViaService': `aidevops.${region}.amazonaws.com`,
+            },
+          },
+        }),
+      );
+    }
+    // Uses AIDevOpsAgentAccessPolicy (AWS managed) + Resource Explorer SLR inline
+    this.agentAccessRole = new iam.Role(this, 'AgentAccessRole', {
+      roleName: `DevOpsAgentRole-AgentSpace-${props.spaceName}`,
+      assumedBy: new iam.ServicePrincipal('aidevops.amazonaws.com', {
+        conditions: {
+          StringEquals: {
+            'aws:SourceAccount': account,
+          },
+        },
+      }),
+      description: `Agent access role for DevOps Agent Space: ${props.spaceName}`,
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AIDevOpsAgentAccessPolicy'),
+      ],
+    });
+
+    // Inline policy: Allow creation of Resource Explorer service-linked role
+    this.agentAccessRole.addToPolicy(new iam.PolicyStatement({
+      sid: 'AllowResourceExplorerSLR',
+      effect: iam.Effect.ALLOW,
+      actions: ['iam:CreateServiceLinkedRole'],
+      resources: [`arn:aws:iam::${account}:role/aws-service-role/resource-explorer-2.amazonaws.com/*`],
+      conditions: {
+        StringEquals: {
+          'iam:AWSServiceName': 'resource-explorer-2.amazonaws.com',
+        },
+      },
+    }));
+
+    // IAM Role: Operator App — for web app console access
+    // Uses AIDevOpsOperatorAppAccessPolicy (AWS managed)
+    this.operatorRole = new iam.Role(this, 'OperatorRole', {
+      roleName: `DevOpsAgentRole-WebappAdmin-${props.spaceName}`,
+      assumedBy: new iam.ServicePrincipal('aidevops.amazonaws.com', {
+        conditions: {
+          StringEquals: {
+            'aws:SourceAccount': account,
+          },
+        },
+      }),
+      description: `Operator app role for DevOps Agent Space: ${props.spaceName}`,
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('AIDevOpsOperatorAppAccessPolicy'),
+      ],
+    });
+
+    // The operator app relies on session tagging (aws:PrincipalTag/AgentSpaceId)
+    // to scope the AIDevOpsOperatorAppAccessPolicy permissions to this space.
+    // This tag is injected by the service via sts:TagSession, so the trust policy
+    // MUST allow it. Without this, features like the new Chat / On-Demand Tasks
+    // experience are not authorized and the console prompts to "update permissions".
+    this.operatorRole.assumeRolePolicy?.addStatements(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        principals: [new iam.ServicePrincipal('aidevops.amazonaws.com')],
+        actions: ['sts:TagSession'],
+        conditions: {
+          StringEquals: {
+            'aws:SourceAccount': account,
+          },
+        },
+      }),
+    );
+
+    // Grant the OPERATOR APP role use of the CMK. The web app decrypts Agent Space
+    // data using this role's credentials, so it needs BOTH a key-policy grant AND an
+    // identity-based policy allowing kms:Decrypt. grantEncryptDecrypt() adds both.
+    // Without it the console fails with:
+    //   "... is not authorized to perform: kms:Decrypt ... because no identity-based
+    //    policy allows the kms:Decrypt action"  (see CloudTrail).
+    this.encryptionKey.grantEncryptDecrypt(this.operatorRole);
+    this.operatorRole.addToPolicy(
+      new iam.PolicyStatement({
+        sid: 'AllowDescribeAgentSpaceKey',
+        effect: iam.Effect.ALLOW,
+        actions: ['kms:DescribeKey'],
+        resources: [this.encryptionKey.keyArn],
+      }),
+    );
+
+    // Build OperatorApp configuration
+    const operatorApp = this.buildOperatorAppConfig(props);
+
+    // Agent Space resource
+    const agentSpace = new devopsagent.CfnAgentSpace(this, 'Resource', {
+      name: props.spaceName,
+      description: props.description,
+      kmsKeyArn: this.encryptionKey.keyArn,
+      locale: props.locale,
+      operatorApp,
+      tags: this.buildTags(props),
+    });
+
+    this.agentSpaceId = agentSpace.attrAgentSpaceId;
+    this.agentSpaceArn = agentSpace.attrArn;
+
+    // After space is created, tighten the trust policy with SourceArn condition
+    // Note: This is a best practice from the official docs but requires the ARN
+    // which is only available after creation. CDK handles this via dependency.
+  }
+
+  private buildOperatorAppConfig(props: DevOpsAgentSpaceProps): devopsagent.CfnAgentSpace.OperatorAppProperty | undefined {
+    if (props.useIdentityCenter && props.identityCenterInstanceArn) {
+      return {
+        idc: {
+          idcInstanceArn: props.identityCenterInstanceArn,
+          operatorAppRoleArn: this.operatorRole.roleArn,
+        },
+      };
+    }
+
+    // Default: IAM authentication
+    return {
+      iam: {
+        operatorAppRoleArn: this.operatorRole.roleArn,
+      },
+    };
+  }
+
+  private buildTags(props: DevOpsAgentSpaceProps): cdk.CfnTag[] {
+    // If custom tags provided, use them directly (organization's own policy)
+    if (props.tags) {
+      return Object.entries(props.tags).map(([key, value]) => ({ key, value }));
+    }
+
+    // Default tags (minimal, always applied)
+    const tags: cdk.CfnTag[] = [
+      { key: 'Environment', value: props.environment },
+      { key: 'ManagedBy', value: 'CDK' },
+    ];
+
+    if (props.projectName) {
+      tags.push({ key: 'Product', value: props.projectName });
+    }
+    if (props.owner) {
+      tags.push({ key: 'Owner', value: props.owner });
+    }
+
+    return tags;
+  }
+}
